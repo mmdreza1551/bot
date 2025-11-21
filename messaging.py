@@ -219,6 +219,13 @@ def send_to_telegram_sync(audio_file: str, call_info: dict, notification_msg_id:
             }
             response = requests.post(url, files=files, data=data, timeout=180)
 
+        if not response.ok:
+            logger.error(
+                "Telegram sendVoice failed: status=%s body=%s",
+                response.status_code,
+                response.text[:500],
+            )
+
         if notification_msg_id:
             try:
                 del_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
