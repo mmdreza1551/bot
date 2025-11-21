@@ -168,6 +168,8 @@ def notify_admins_sync(message: str):
 
 def notify_connection_lost(reason: str = "Unknown"):
     """اطلاع قطع اتصال به ادمین‌ها"""
+    global connection_issue_reported
+    connection_issue_reported = True
     message = (
         "⚠️ <b>Connection Lost</b>\n\n"
         f"Reason: {reason}\n"
@@ -184,6 +186,36 @@ def notify_connection_restored():
         f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
     notify_admins_sync(message)
+
+
+def quit_driver_safely():
+    global driver_instance
+    try:
+        if driver_instance:
+            driver_instance.quit()
+    except Exception:
+        pass
+    finally:
+        driver_instance = None
+
+
+def initialize_driver_with_login() -> bool:
+    """Setup driver and ensure authenticated session with auto alerting."""
+    global driver_instance, connection_issue_reported
+    try:
+        driver_instance = setup_driver()
+        if login_to_orangecarrier(driver_instance):
+            connection_issue_reported = False
+            return True
+        notify_connection_lost("Login failed after driver init")
+        connection_issue_reported = True
+    except Exception as e:
+        logger.error(f"Driver init/login error: {e}")
+        notify_connection_lost(f"Driver init/login error: {e}")
+        connection_issue_reported = True
+
+    quit_driver_safely()
+    return False
 
 # ==================== Driver Setup ====================
 
@@ -644,6 +676,17 @@ def monitor_calls_with_recovery():
     max_errors = 5
 
     while is_monitoring:
+        if driver_instance is None:
+            previous_issue = connection_issue_reported
+            if not initialize_driver_with_login():
+                consecutive_errors += 1
+                time.sleep(bot_settings.get('retry_delay', 30))
+                continue
+
+            if previous_issue:
+                notify_connection_restored()
+            consecutive_errors = 0
+
         try:
             try:
                 driver_instance.get(ORANGECARRIER_CALLS_URL)
@@ -659,7 +702,8 @@ def monitor_calls_with_recovery():
                         if consecutive_errors >= max_errors:
                             logger.error("❌ Max errors reached")
                             notify_connection_lost(f"Max errors ({max_errors})")
-                            break
+                            quit_driver_safely()
+                            continue
                         time.sleep(bot_settings.get('retry_delay', 30))
                         continue
                     consecutive_errors = 0
@@ -671,7 +715,9 @@ def monitor_calls_with_recovery():
                     notify_connection_lost(f"Connection check failed: {e}")
                     connection_issue_reported = True
                 if consecutive_errors >= max_errors:
-                    break
+                    notify_connection_lost(f"Max errors reached ({consecutive_errors}) - restarting")
+                    quit_driver_safely()
+                    continue
                 time.sleep(bot_settings.get('retry_delay', 30))
                 continue
 
@@ -708,8 +754,10 @@ def monitor_calls_with_recovery():
             logger.error(f"Monitoring error: {e}")
             consecutive_errors += 1
             if consecutive_errors >= max_errors:
-                notify_connection_lost(f"Too many errors: {e}")
-                break
+                notify_connection_lost(f"Too many errors: {e} — restarting driver")
+                quit_driver_safely()
+                consecutive_errors = 0
+                continue
             time.sleep(10)
 
     logger.info("Monitoring stopped")
@@ -921,11 +969,6 @@ def start_monitoring_thread():
         return
 
     try:
-        driver_instance = setup_driver()
-        if not login_to_orangecarrier(driver_instance):
-            logger.error("Login failed")
-            return
-
         is_monitoring = True
         monitoring_thread = threading.Thread(
             target=monitor_calls_with_recovery,
@@ -978,6 +1021,7 @@ if __name__ == "__main__":
                 pass
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
+        notify_admins_error("Fatal crash", str(e))
         is_monitoring = False
         if driver_instance:
             try:
