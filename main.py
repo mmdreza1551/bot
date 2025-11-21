@@ -3,14 +3,12 @@ import sys
 try:
     import selenium
     import requests
-    import phonenumbers
     import pytz
     from telegram import Bot
     from webdriver_manager.chrome import ChromeDriverManager
-    from PIL import Image
 except ImportError as e:
     print(f"ERROR: Missing required package: {e}")
-    print("Please run: pip install -r requirements.txt pillow")
+    print("Please run: pip install -r requirements.txt")
     sys.exit(1)
 
 import os
@@ -27,10 +25,8 @@ from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
-import phonenumbers
-from phonenumbers import geocoder
 import subprocess
 from datetime import datetime
 import pytz
@@ -38,7 +34,21 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import json
 import shlex
-from PIL import Image
+import traceback
+
+from config import (
+    ADMIN_IDS,
+    DEFAULT_SETTINGS,
+    LOGIN_EMAIL,
+    LOGIN_PASSWORD,
+    ORANGECARRIER_CALLS_URL,
+    ORANGECARRIER_LOGIN_URL,
+    SETTINGS_FILE,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    VOICE_MODE,
+)
+from messaging import broadcast_admins_sync, send_instant_notification_sync, send_to_telegram_sync
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,40 +56,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== Config ====================
-
-ORANGECARRIER_LOGIN_URL = "https://www.orangecarrier.com/login"
-ORANGECARRIER_CALLS_URL = "https://www.orangecarrier.com/live/calls"
-
-# Credentials
-LOGIN_EMAIL = 'jawewwedwe@gmail.com'
-LOGIN_PASSWORD = 'Awedwedew?123'
-TELEGRAM_BOT_TOKEN = '720285473:asF5AllyFhUV6XYSOwXLt12lWdKu74'
-TELEGRAM_CHAT_ID = '-1003128914525'
-
-# Admin Configuration - آیدی عددی ادمین‌ها
-ADMIN_IDS = ['1651389674', '96384286']
-
-# Settings File
-SETTINGS_FILE = 'bot_settings.json'
-BACKGROUND_IMAGE = 'background.jpg'
-
-# Default Settings
-DEFAULT_SETTINGS = {
-    'send_mode': 'video',
-    'has_background': False,
-    'background_dimensions': {'width': 320, 'height': 320},
-    'monitoring_active': True,
-    'retry_attempts': 3,
-    'retry_delay': 30
-}
-
 # Global state
 bot_settings = DEFAULT_SETTINGS.copy()
 processed_calls = set()
 driver_instance = None
 is_monitoring = False
 telegram_app = None
+connection_issue_reported = False
 
 # ==================== Settings Manager ====================
 
@@ -89,7 +72,8 @@ def load_settings():
     try:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r') as f:
-                bot_settings = json.load(f)
+                persisted = json.load(f)
+                bot_settings = {**DEFAULT_SETTINGS, **persisted}
             logger.info("✅ Settings loaded successfully")
         else:
             save_settings()
@@ -142,63 +126,26 @@ def wait_size_stable(session, url, headers, stable_checks=5, max_wait=90):
         waited += 1
     return last
 
-def country_code_to_flag(country_code):
-    if not country_code or len(country_code) != 2:
-        return '🌍'
-    country_code = country_code.upper()
-    flag = ''.join(chr(0x1F1E6 + ord(char) - ord('A')) for char in country_code)
-    return flag
+# ==================== Admin Notification System ====================
 
-def get_country_flag_and_name(phone_number):
-    try:
-        clean_number = re.sub(r'[^\d+]', '', str(phone_number))
-        if not clean_number.startswith('+'):
-            clean_number = '+' + clean_number
-        try:
-            parsed = phonenumbers.parse(clean_number, None)
-            from phonenumbers import region_code_for_number
-            country_iso = region_code_for_number(parsed)
-            country_name = geocoder.description_for_number(parsed, "en")
-            flag = country_code_to_flag(country_iso) if country_iso else '🌍'
-            if not country_name:
-                country_name = f"{country_iso} +{parsed.country_code}" if country_iso else f"+{parsed.country_code}"
-            return flag, country_name
-        except Exception:
-            match = re.match(r'\+?(\d{1,4})', clean_number)
-            if match:
-                code = match.group(1)
-                return '🌍', f"Country Code +{code}"
-        return '🌍', "Unknown"
-    except Exception:
-        return '🌍', "Unknown"
-
-def get_image_dimensions(image_path):
-    """دریافت ابعاد تصویر"""
-    try:
-        with Image.open(image_path) as img:
-            return img.size
-    except Exception as e:
-        logger.error(f"Error getting image dimensions: {e}")
-        return (320, 320)
+def notify_admins_error(title: str, details: str):
+    message = (
+        f"❗ <b>{title}</b>\n\n"
+        f"{details}\n\n"
+        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    notify_admins_sync(message)
 
 # ==================== Admin Notification System ====================
 
 def notify_admins_sync(message: str):
     """ارسال نوتیفیکیشن به تمام ادمین‌ها (سینک)"""
-    for admin_id in ADMIN_IDS:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            data = {
-                'chat_id': admin_id,
-                'text': f"🔔 <b>Admin Notification</b>\n\n{message}",
-                'parse_mode': 'HTML'
-            }
-            requests.post(url, data=data, timeout=10)
-        except Exception as e:
-            logger.error(f"Failed to notify admin {admin_id}: {e}")
+    broadcast_admins_sync(message, ADMIN_IDS)
 
 def notify_connection_lost(reason: str = "Unknown"):
     """اطلاع قطع اتصال به ادمین‌ها"""
+    global connection_issue_reported
+    connection_issue_reported = True
     message = (
         "⚠️ <b>Connection Lost</b>\n\n"
         f"Reason: {reason}\n"
@@ -215,6 +162,36 @@ def notify_connection_restored():
         f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
     notify_admins_sync(message)
+
+
+def quit_driver_safely():
+    global driver_instance
+    try:
+        if driver_instance:
+            driver_instance.quit()
+    except Exception:
+        pass
+    finally:
+        driver_instance = None
+
+
+def initialize_driver_with_login() -> bool:
+    """Setup driver and ensure authenticated session with auto alerting."""
+    global driver_instance, connection_issue_reported
+    try:
+        driver_instance = setup_driver()
+        if login_to_orangecarrier(driver_instance):
+            connection_issue_reported = False
+            return True
+        notify_connection_lost("Login failed after driver init")
+        connection_issue_reported = True
+    except Exception as e:
+        logger.error(f"Driver init/login error: {e}")
+        notify_connection_lost(f"Driver init/login error: {e}")
+        connection_issue_reported = True
+
+    quit_driver_safely()
+    return False
 
 # ==================== Driver Setup ====================
 
@@ -300,6 +277,7 @@ def login_to_orangecarrier(driver, max_retries: int = 3) -> bool:
                 notify_connection_lost(f"Login failed after {max_retries} attempts")
             time.sleep(bot_settings.get('retry_delay', 30))
 
+    logger.error("❌ Login failed after all retries; site not reachable")
     return False
 
 # ==================== Call Processing ====================
@@ -561,7 +539,7 @@ def get_active_calls(driver):
         return []
 
 def download_audio_via_api(session_cookies, did, uuid, call_id, wait_for_completion=True):
-    """Download audio via API"""
+    """Download audio via API with stronger completeness checks"""
     try:
         api_url = f"https://www.orangecarrier.com/live/calls/sound?did={did}&uuid={uuid}"
 
@@ -579,8 +557,13 @@ def download_audio_via_api(session_cookies, did, uuid, call_id, wait_for_complet
 
         if wait_for_completion:
             logger.info(f"⏳ [{call_id}] Waiting for recording...")
-            wait_size_stable(session, api_url + f"&_ts={int(time.time())}", headers,
-                             stable_checks=5, max_wait=90)
+            wait_size_stable(
+                session,
+                api_url + f"&_ts={int(time.time())}",
+                headers,
+                stable_checks=6,
+                max_wait=120,
+            )
 
         r = session.get(api_url + f"&_ts={int(time.time())}", headers=headers, timeout=180)
         r.raise_for_status()
@@ -596,11 +579,20 @@ def download_audio_via_api(session_cookies, did, uuid, call_id, wait_for_complet
             f.write(r.content)
 
         target = 6.5
-        for attempt in range(3):
+        max_attempts = 5
+        for attempt in range(max_attempts):
             dur = ffprobe_duration(filename)
             if dur >= target:
                 return filename
-            time.sleep(3 * (attempt + 1))
+
+            wait_size_stable(
+                session,
+                api_url + f"&_ts={int(time.time())}",
+                headers,
+                stable_checks=4,
+                max_wait=45,
+            )
+            time.sleep(2 * (attempt + 1))
             r = session.get(api_url + f"&_ts={int(time.time())}", headers=headers, timeout=180)
             r.raise_for_status()
             with open(filename, 'wb') as f:
@@ -610,243 +602,6 @@ def download_audio_via_api(session_cookies, did, uuid, call_id, wait_for_complet
     except Exception as e:
         logger.error(f"❌ [{call_id}] Download failed: {e}")
         return None
-
-def send_instant_notification_sync(call_info):
-    """Send instant notification (sync)"""
-    try:
-        flag, country_name = get_country_flag_and_name(call_info['did'])
-        phone_display = call_info['did'] if call_info['did'].startswith('+') else f"+{call_info['did']}"
-
-        try:
-            parsed = phonenumbers.parse(phone_display, None)
-            country_code = f"+{parsed.country_code}"
-            national_number = str(parsed.national_number)
-            masked_national = (
-                '*' * (len(national_number) - 3) + national_number[-3:]
-                if len(national_number) > 3 else national_number
-            )
-            masked_phone = country_code + masked_national
-        except Exception:
-            masked_phone = (
-                phone_display[:4] + '******' + phone_display[-3:]
-                if len(phone_display) > 7 else phone_display
-            )
-
-        message = (
-            "<b>📞 𝙽𝚎𝚠 𝚌𝚊𝚕𝚕 𝚛𝚎𝚌𝚎𝚒𝚟𝚎 𝚠𝚊𝚒𝚝𝚒𝚗𝚐</b>\n\n"
-            f"{flag} <code>{masked_phone}</code>"
-        )
-
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'HTML'
-        }
-        response = requests.post(url, data=data, timeout=10)
-        result = response.json()
-
-        if result.get('ok'):
-            return result['result']['message_id']
-        return None
-    except Exception as e:
-        logger.error(f"Notification error: {e}")
-        return None
-
-def convert_to_ogg_opus(input_file: str) -> str:
-    """
-    تبدیل هر نوع فایل صوتی (wav/mp3/...) به ogg/opus برای sendVoice تلگرام
-    """
-    base, _ = os.path.splitext(input_file)
-    ogg_file = base + ".ogg"
-
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-i", input_file,
-                "-c:a", "libopus",
-                "-b:a", "64k",
-                "-vn",
-                ogg_file,
-            ],
-            check=True,
-            capture_output=True,
-            timeout=120
-        )
-        return ogg_file
-    except Exception as e:
-        logger.error(f"FFmpeg ogg/opus convert error: {e}")
-        return input_file  # اگر شکست خورد همان فایل اصلی را برگردان (fallback)
-
-def send_to_telegram_sync(audio_file, call_info, notification_msg_id=None):
-    """Send to Telegram (sync)"""
-    try:
-        flag, country_name = get_country_flag_and_name(call_info['did'])
-        phone_display = call_info['did'] if call_info['did'].startswith('+') else f"+{call_info['did']}"
-
-        try:
-            parsed = phonenumbers.parse(phone_display, None)
-            country_code = f"+{parsed.country_code}"
-            national_number = str(parsed.national_number)
-            masked_national = (
-                '*' * (len(national_number) - 3) + national_number[-3:]
-                if len(national_number) > 3 else national_number
-            )
-            masked_phone = country_code + masked_national
-        except Exception:
-            masked_phone = (
-                phone_display[:4] + '******' + phone_display[-3:]
-                if len(phone_display) > 7 else phone_display
-            )
-
-        bd_timezone = pytz.timezone('Asia/Dhaka')
-        bd_time = datetime.now(bd_timezone)
-        date_str = bd_time.strftime('%m/%d/%Y')
-        time_str = bd_time.strftime('%I:%M:%S')
-        period = bd_time.strftime('%p')
-
-        duration_num = 30
-        try:
-            result = subprocess.run(
-                [
-                    'ffprobe', '-v', 'error', '-show_entries',
-                    'format=duration', '-of',
-                    'default=noprint_wrappers=1:nokey=1', audio_file
-                ],
-                capture_output=True, text=True, timeout=10
-            )
-
-            if result.returncode == 0:
-                duration_str = result.stdout.strip()
-                if duration_str:
-                    duration_num = int(float(duration_str))
-        except Exception:
-            pass
-
-        caption = (
-            "📞 <b>𝙽𝚎𝚠 𝚅𝚘𝚒𝚌𝚎</b>\n\n"
-            f"{flag} <b>𝙲𝚘𝚞𝚗𝚝𝚛𝚢:</b> <code>{country_name}</code>\n"
-            f"📍 <b>𝙽𝚞𝚖𝚋𝚎𝚛:</b> <code>{masked_phone}</code>\n"
-            f"⏰ <b>𝚃𝚒𝚖𝚎:</b> <code>{date_str}</code>, <code>{time_str}</code> <code>{period}</code>"
-        )
-
-        send_mode = bot_settings.get('send_mode', 'video')
-
-        if send_mode == 'voice':
-            # اول به ogg/opus تبدیل کن
-            ogg_file = convert_to_ogg_opus(audio_file)
-
-            # دوباره طول را از روی فایل نهایی حساب کن
-            try:
-                result = subprocess.run(
-                    [
-                        'ffprobe', '-v', 'error', '-show_entries',
-                        'format=duration', '-of',
-                        'default=noprint_wrappers=1:nokey=1', ogg_file
-                    ],
-                    capture_output=True, text=True, timeout=10
-                )
-
-                if result.returncode == 0:
-                    duration_str = result.stdout.strip()
-                    if duration_str:
-                        duration_num = int(float(duration_str))
-            except Exception:
-                pass
-
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVoice"
-            with open(ogg_file, 'rb') as audio:
-                files = {'voice': audio}
-                data = {
-                    'chat_id': TELEGRAM_CHAT_ID,
-                    'caption': caption,
-                    'parse_mode': 'HTML',
-                    'duration': duration_num
-                }
-                response = requests.post(url, files=files, data=data, timeout=120)
-
-            # بعد از ارسال، ogg موقت را پاک کن
-            if os.path.exists(ogg_file) and ogg_file != audio_file:
-                try:
-                    os.remove(ogg_file)
-                except Exception:
-                    pass
-        else:
-            # Send as video
-            video_file = audio_file.replace('.mp3', '.mp4').replace('.wav', '.mp4')
-
-            if bot_settings.get('has_background') and os.path.exists(BACKGROUND_IMAGE):
-                width = bot_settings['background_dimensions']['width']
-                height = bot_settings['background_dimensions']['height']
-                bg_cmd = ['-loop', '1', '-i', BACKGROUND_IMAGE]
-            else:
-                width, height = 320, 320
-                bg_cmd = ['-f', 'lavfi', '-i', f'color=c=black:s={width}x{height}:d={duration_num}']
-
-            try:
-                subprocess.run(
-                    [
-                        'ffmpeg', '-y',
-                        *bg_cmd,
-                        '-i', audio_file,
-                        '-shortest',
-                        '-c:v', 'libx264',
-                        '-c:a', 'aac',
-                        '-vf', f'scale={width}:{height}',
-                        video_file
-                    ],
-                    check=True, capture_output=True, timeout=120
-                )
-
-                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
-                with open(video_file, 'rb') as video:
-                    files = {'video': video}
-                    data = {
-                        'chat_id': TELEGRAM_CHAT_ID,
-                        'caption': caption,
-                        'parse_mode': 'HTML',
-                        'width': width,
-                        'height': height,
-                        'duration': duration_num,
-                        'supports_streaming': True
-                    }
-                    response = requests.post(url, files=files, data=data, timeout=120)
-
-                if os.path.exists(video_file):
-                    os.remove(video_file)
-            except Exception:
-                # Fallback to voice
-                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVoice"
-                with open(audio_file, 'rb') as audio:
-                    files = {'voice': audio}
-                    data = {
-                        'chat_id': TELEGRAM_CHAT_ID,
-                        'caption': caption,
-                        'parse_mode': 'HTML',
-                        'duration': duration_num
-                    }
-                    response = requests.post(url, files=files, data=data, timeout=120)
-
-        # Delete instant notification message
-        if notification_msg_id:
-            try:
-                del_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
-                requests.post(
-                    del_url,
-                    data={'chat_id': TELEGRAM_CHAT_ID, 'message_id': notification_msg_id},
-                    timeout=10
-                )
-            except Exception:
-                pass
-
-        if os.path.exists(audio_file):
-            os.remove(audio_file)
-
-        return response.json().get('ok', False)
-    except Exception as e:
-        logger.error(f"Telegram send error: {e}")
-        return False
 
 def process_single_call(session_cookies, call, notification_msg_id=None):
     """Process single call"""
@@ -868,16 +623,29 @@ def process_single_call(session_cookies, call, notification_msg_id=None):
                 if success:
                     logger.info(f"✅ [{call_id}] Forwarded!")
                     return True
+                notify_admins_error(
+                    "Telegram send failed",
+                    f"Call {call_id} could not be delivered."
+                )
+            else:
+                notify_admins_error(
+                    "Download failed",
+                    f"Call {call_id} audio was empty or unavailable."
+                )
         return False
     except Exception as e:
         logger.error(f"❌ [{call_id}] Error: {e}")
+        notify_admins_error(
+            "Call processing error",
+            f"{call_id}: {e}\n{traceback.format_exc(limit=1)}"
+        )
         return False
 
 # ==================== Monitoring ====================
 
 def monitor_calls_with_recovery():
     """Monitor calls with auto-recovery"""
-    global is_monitoring, driver_instance
+    global is_monitoring, driver_instance, connection_issue_reported
 
     logger.info("🚀 Starting monitoring...")
 
@@ -885,6 +653,17 @@ def monitor_calls_with_recovery():
     max_errors = 5
 
     while is_monitoring:
+        if driver_instance is None:
+            previous_issue = connection_issue_reported
+            if not initialize_driver_with_login():
+                consecutive_errors += 1
+                time.sleep(bot_settings.get('retry_delay', 30))
+                continue
+
+            if previous_issue:
+                notify_connection_restored()
+            consecutive_errors = 0
+
         try:
             try:
                 driver_instance.get(ORANGECARRIER_CALLS_URL)
@@ -892,26 +671,39 @@ def monitor_calls_with_recovery():
 
                 if "login" in driver_instance.current_url.lower():
                     logger.warning("⚠️ Session expired, reconnecting...")
-                    notify_connection_lost("Session expired")
+                    if not connection_issue_reported:
+                        notify_connection_lost("Session expired")
+                        connection_issue_reported = True
                     if not login_to_orangecarrier(driver_instance):
                         consecutive_errors += 1
                         if consecutive_errors >= max_errors:
                             logger.error("❌ Max errors reached")
                             notify_connection_lost(f"Max errors ({max_errors})")
-                            break
+                            quit_driver_safely()
+                            continue
                         time.sleep(bot_settings.get('retry_delay', 30))
                         continue
                     consecutive_errors = 0
+                    connection_issue_reported = False
             except Exception as e:
                 logger.error(f"Connection check failed: {e}")
                 consecutive_errors += 1
+                if not connection_issue_reported:
+                    notify_connection_lost(f"Connection check failed: {e}")
+                    connection_issue_reported = True
                 if consecutive_errors >= max_errors:
-                    break
+                    notify_connection_lost(f"Max errors reached ({consecutive_errors}) - restarting")
+                    quit_driver_safely()
+                    continue
                 time.sleep(bot_settings.get('retry_delay', 30))
                 continue
 
             session_cookies = driver_instance.get_cookies()
             calls = get_active_calls(driver_instance)
+
+            if connection_issue_reported:
+                notify_connection_restored()
+                connection_issue_reported = False
 
             if calls:
                 new_calls = [call for call in calls if call['id'] not in processed_calls]
@@ -939,8 +731,10 @@ def monitor_calls_with_recovery():
             logger.error(f"Monitoring error: {e}")
             consecutive_errors += 1
             if consecutive_errors >= max_errors:
-                notify_connection_lost(f"Too many errors: {e}")
-                break
+                notify_connection_lost(f"Too many errors: {e} — restarting driver")
+                quit_driver_safely()
+                consecutive_errors = 0
+                continue
             time.sleep(10)
 
     logger.info("Monitoring stopped")
@@ -957,9 +751,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [InlineKeyboardButton("📊 Status", callback_data="status")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
-        [InlineKeyboardButton("🖼️ Change Background", callback_data="change_bg")],
-        [InlineKeyboardButton("🔄 Toggle Mode", callback_data="toggle_mode")],
         [InlineKeyboardButton("📈 Statistics", callback_data="stats")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -968,8 +759,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎛️ <b>OrangeCarrier Admin Panel</b>\n\n"
         "Welcome to admin control panel!\n\n"
         "📱 <b>Quick Info:</b>\n"
-        f"• Mode: <code>{bot_settings.get('send_mode', 'video').upper()}</code>\n"
-        f"• Background: <code>{'Custom' if bot_settings.get('has_background') else 'Black'}</code>\n"
+        f"• Mode: <code>{VOICE_MODE.upper()}</code>\n"
         f"• Status: <code>{'🟢 Active' if is_monitoring else '🔴 Stopped'}</code>"
     )
 
@@ -983,10 +773,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📊 <b>System Status</b>\n\n"
         f"🔄 Monitoring: <code>{'🟢 Active' if is_monitoring else '🔴 Stopped'}</code>\n"
-        f"📤 Send Mode: <code>{bot_settings.get('send_mode', 'video').upper()}</code>\n"
-        f"🖼️ Background: <code>{'Custom' if bot_settings.get('has_background') else 'Black'}</code>\n"
-        f"📏 Dimensions: <code>{bot_settings['background_dimensions']['width']}x"
-        f"{bot_settings['background_dimensions']['height']}</code>\n"
+        f"📤 Send Mode: <code>{VOICE_MODE.upper()}</code>\n"
         f"📞 Processed: <code>{len(processed_calls)}</code>\n"
         f"⏰ Time: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
     )
@@ -998,118 +785,6 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show settings"""
-    query = update.callback_query
-    await query.answer()
-
-    text = (
-        "⚙️ <b>Settings Menu</b>\n\n"
-        f"Mode: <b>{bot_settings.get('send_mode', 'video').upper()}</b>\n"
-        f"Background: <b>{'Custom' if bot_settings.get('has_background') else 'Default'}</b>"
-    )
-
-    keyboard = [
-        [InlineKeyboardButton("🔄 Toggle Mode", callback_data="toggle_mode")],
-        [InlineKeyboardButton("🖼️ Change Background", callback_data="change_bg")],
-        [InlineKeyboardButton("🗑️ Remove Background", callback_data="remove_bg")],
-        [InlineKeyboardButton("♻️ Reset Settings", callback_data="reset_settings")],
-        [InlineKeyboardButton("« Back", callback_data="back_to_main")]
-    ]
-    await query.edit_message_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def toggle_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle mode"""
-    query = update.callback_query
-
-    current_mode = bot_settings.get('send_mode', 'video')
-    new_mode = 'voice' if current_mode == 'video' else 'video'
-    bot_settings['send_mode'] = new_mode
-    save_settings()
-
-    await query.answer(f"✅ Mode: {new_mode.upper()}", show_alert=True)
-    await settings_handler(update, context)
-
-async def change_background_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Request background"""
-    query = update.callback_query
-    await query.answer()
-
-    text = (
-        "🖼️ <b>Upload Background Image</b>\n\n"
-        "Send me an image to use as background.\n\n"
-        "📝 Tips:\n"
-        "• Any size supported\n"
-        "• Video will match image size\n"
-        "• JPG/PNG supported\n\n"
-        "Send the image now..."
-    )
-
-    keyboard = [[InlineKeyboardButton("« Cancel", callback_data="settings")]]
-    await query.edit_message_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def handle_background_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle uploaded image"""
-    user_id = str(update.effective_user.id)
-
-    if user_id not in ADMIN_IDS:
-        return
-
-    try:
-        photo = update.message.photo[-1]
-        photo_file = await photo.get_file()
-        await photo_file.download_to_drive(BACKGROUND_IMAGE)
-
-        width, height = get_image_dimensions(BACKGROUND_IMAGE)
-
-        bot_settings['has_background'] = True
-        bot_settings['background_dimensions'] = {'width': width, 'height': height}
-        save_settings()
-
-        await update.message.reply_text(
-            f"✅ <b>Background Updated!</b>\n\n"
-            f"📏 Dimensions: <code>{width}x{height}</code>",
-            parse_mode=ParseMode.HTML
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
-async def remove_background_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove background"""
-    query = update.callback_query
-
-    if os.path.exists(BACKGROUND_IMAGE):
-        os.remove(BACKGROUND_IMAGE)
-
-    bot_settings['has_background'] = False
-    bot_settings['background_dimensions'] = {'width': 320, 'height': 320}
-    save_settings()
-
-    await query.answer("✅ Background removed", show_alert=True)
-    await settings_handler(update, context)
-
-async def reset_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reset settings"""
-    query = update.callback_query
-
-    global bot_settings
-    bot_settings = DEFAULT_SETTINGS.copy()
-    save_settings()
-
-    if os.path.exists(BACKGROUND_IMAGE):
-        os.remove(BACKGROUND_IMAGE)
-
-    await query.answer("✅ Settings reset", show_alert=True)
-    await settings_handler(update, context)
-
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show stats"""
     query = update.callback_query
@@ -1118,8 +793,7 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📈 <b>Statistics</b>\n\n"
         f"📞 Total Calls: <code>{len(processed_calls)}</code>\n"
-        f"💾 Settings: <code>{'✅' if os.path.exists(SETTINGS_FILE) else '❌'}</code>\n"
-        f"🖼️ Background: <code>{'✅' if os.path.exists(BACKGROUND_IMAGE) else '❌'}</code>"
+        f"💾 Settings: <code>{'✅' if os.path.exists(SETTINGS_FILE) else '❌'}</code>"
     )
 
     keyboard = [[InlineKeyboardButton("« Back", callback_data="back_to_main")]]
@@ -1136,9 +810,6 @@ async def back_to_main_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     keyboard = [
         [InlineKeyboardButton("📊 Status", callback_data="status")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
-        [InlineKeyboardButton("🖼️ Change Background", callback_data="change_bg")],
-        [InlineKeyboardButton("🔄 Toggle Mode", callback_data="toggle_mode")],
         [InlineKeyboardButton("📈 Statistics", callback_data="stats")]
     ]
 
@@ -1146,8 +817,7 @@ async def back_to_main_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         "🎛️ <b>OrangeCarrier Admin Panel</b>\n\n"
         "Welcome to admin control panel!\n\n"
         "📱 <b>Quick Info:</b>\n"
-        f"• Mode: <code>{bot_settings.get('send_mode', 'video').upper()}</code>\n"
-        f"• Background: <code>{'Custom' if bot_settings.get('has_background') else 'Black'}</code>\n"
+        f"• Mode: <code>{VOICE_MODE.upper()}</code>\n"
         f"• Status: <code>{'🟢 Active' if is_monitoring else '🔴 Stopped'}</code>"
     )
 
@@ -1168,11 +838,6 @@ def start_monitoring_thread():
         return
 
     try:
-        driver_instance = setup_driver()
-        if not login_to_orangecarrier(driver_instance):
-            logger.error("Login failed")
-            return
-
         is_monitoring = True
         monitoring_thread = threading.Thread(
             target=monitor_calls_with_recovery,
@@ -1202,21 +867,8 @@ def main():
     # Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(status_handler, pattern="^status$"))
-    app.add_handler(CallbackQueryHandler(settings_handler, pattern="^settings$"))
-    app.add_handler(CallbackQueryHandler(toggle_mode_handler, pattern="^toggle_mode$"))
-    app.add_handler(CallbackQueryHandler(change_background_handler, pattern="^change_bg$"))
-    app.add_handler(CallbackQueryHandler(remove_background_handler, pattern="^remove_bg$"))
-    app.add_handler(CallbackQueryHandler(reset_settings_handler, pattern="^reset_settings$"))
     app.add_handler(CallbackQueryHandler(stats_handler, pattern="^stats$"))
     app.add_handler(CallbackQueryHandler(back_to_main_handler, pattern="^back_to_main$"))
-
-    # فقط ادمین‌ها اجازه آپلود بک‌گراند دارند
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO & filters.User(user_id=[int(i) for i in ADMIN_IDS]),
-            handle_background_image
-        )
-    )
 
     logger.info("🤖 Telegram bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -1234,6 +886,7 @@ if __name__ == "__main__":
                 pass
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
+        notify_admins_error("Fatal crash", str(e))
         is_monitoring = False
         if driver_instance:
             try:

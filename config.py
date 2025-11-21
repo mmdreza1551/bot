@@ -1,0 +1,32 @@
+import os
+
+# ==================== Config ====================
+
+ORANGECARRIER_LOGIN_URL = "https://www.orangecarrier.com/login"
+ORANGECARRIER_CALLS_URL = "https://www.orangecarrier.com/live/calls"
+
+# Credentials
+LOGIN_EMAIL = 'jawewwedwe@gmail.com'
+LOGIN_PASSWORD = 'Awedwedew?123'
+TELEGRAM_BOT_TOKEN = '720285473:asF5AllyFhUV6XYSOwXLt12lWdKu74'
+TELEGRAM_CHAT_ID = '-1003128914525'
+
+# Telegram API (Telethon)
+TELEGRAM_API_ID = int(os.getenv('TELEGRAM_API_ID', '123456'))
+TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH', 'your_api_hash')
+TELETHON_SESSION = os.getenv('TELETHON_SESSION', 'orange_bot')
+
+# Admin Configuration - آیدی عددی ادمین‌ها
+ADMIN_IDS = ['1651389674', '96384286']
+
+# Settings File
+SETTINGS_FILE = 'bot_settings.json'
+
+# Default Settings
+DEFAULT_SETTINGS = {
+    'monitoring_active': True,
+    'retry_attempts': 3,
+    'retry_delay': 30
+}
+
+VOICE_MODE = 'voice'
