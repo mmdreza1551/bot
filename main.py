@@ -3,7 +3,6 @@ import sys
 try:
     import selenium
     import requests
-    import phonenumbers
     import pytz
     from telegram import Bot
     from webdriver_manager.chrome import ChromeDriverManager
@@ -29,8 +28,6 @@ from webdriver_manager.chrome import ChromeDriverManager
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.constants import ParseMode
-import phonenumbers
-from phonenumbers import geocoder
 import subprocess
 from datetime import datetime
 import pytz
@@ -40,39 +37,26 @@ import json
 import shlex
 from PIL import Image
 
+from config import (
+    ADMIN_IDS,
+    BACKGROUND_IMAGE,
+    DEFAULT_SETTINGS,
+    LOGIN_EMAIL,
+    LOGIN_PASSWORD,
+    ORANGECARRIER_CALLS_URL,
+    ORANGECARRIER_LOGIN_URL,
+    SETTINGS_FILE,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    VOICE_MODE,
+)
+from messaging import send_instant_notification_sync, send_to_telegram_sync
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# ==================== Config ====================
-
-ORANGECARRIER_LOGIN_URL = "https://www.orangecarrier.com/login"
-ORANGECARRIER_CALLS_URL = "https://www.orangecarrier.com/live/calls"
-
-# Credentials
-LOGIN_EMAIL = 'jawewwedwe@gmail.com'
-LOGIN_PASSWORD = 'Awedwedew?123'
-TELEGRAM_BOT_TOKEN = '720285473:asF5AllyFhUV6XYSOwXLt12lWdKu74'
-TELEGRAM_CHAT_ID = '-1003128914525'
-
-# Admin Configuration - آیدی عددی ادمین‌ها
-ADMIN_IDS = ['1651389674', '96384286']
-
-# Settings File
-SETTINGS_FILE = 'bot_settings.json'
-BACKGROUND_IMAGE = 'background.jpg'
-
-# Default Settings
-DEFAULT_SETTINGS = {
-    'send_mode': 'video',
-    'has_background': False,
-    'background_dimensions': {'width': 320, 'height': 320},
-    'monitoring_active': True,
-    'retry_attempts': 3,
-    'retry_delay': 30
-}
 
 # Global state
 bot_settings = DEFAULT_SETTINGS.copy()
@@ -89,7 +73,8 @@ def load_settings():
     try:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r') as f:
-                bot_settings = json.load(f)
+                persisted = json.load(f)
+                bot_settings = {**DEFAULT_SETTINGS, **persisted}
             logger.info("✅ Settings loaded successfully")
         else:
             save_settings()
@@ -141,36 +126,6 @@ def wait_size_stable(session, url, headers, stable_checks=5, max_wait=90):
         time.sleep(1)
         waited += 1
     return last
-
-def country_code_to_flag(country_code):
-    if not country_code or len(country_code) != 2:
-        return '🌍'
-    country_code = country_code.upper()
-    flag = ''.join(chr(0x1F1E6 + ord(char) - ord('A')) for char in country_code)
-    return flag
-
-def get_country_flag_and_name(phone_number):
-    try:
-        clean_number = re.sub(r'[^\d+]', '', str(phone_number))
-        if not clean_number.startswith('+'):
-            clean_number = '+' + clean_number
-        try:
-            parsed = phonenumbers.parse(clean_number, None)
-            from phonenumbers import region_code_for_number
-            country_iso = region_code_for_number(parsed)
-            country_name = geocoder.description_for_number(parsed, "en")
-            flag = country_code_to_flag(country_iso) if country_iso else '🌍'
-            if not country_name:
-                country_name = f"{country_iso} +{parsed.country_code}" if country_iso else f"+{parsed.country_code}"
-            return flag, country_name
-        except Exception:
-            match = re.match(r'\+?(\d{1,4})', clean_number)
-            if match:
-                code = match.group(1)
-                return '🌍', f"Country Code +{code}"
-        return '🌍', "Unknown"
-    except Exception:
-        return '🌍', "Unknown"
 
 def get_image_dimensions(image_path):
     """دریافت ابعاد تصویر"""
@@ -611,243 +566,6 @@ def download_audio_via_api(session_cookies, did, uuid, call_id, wait_for_complet
         logger.error(f"❌ [{call_id}] Download failed: {e}")
         return None
 
-def send_instant_notification_sync(call_info):
-    """Send instant notification (sync)"""
-    try:
-        flag, country_name = get_country_flag_and_name(call_info['did'])
-        phone_display = call_info['did'] if call_info['did'].startswith('+') else f"+{call_info['did']}"
-
-        try:
-            parsed = phonenumbers.parse(phone_display, None)
-            country_code = f"+{parsed.country_code}"
-            national_number = str(parsed.national_number)
-            masked_national = (
-                '*' * (len(national_number) - 3) + national_number[-3:]
-                if len(national_number) > 3 else national_number
-            )
-            masked_phone = country_code + masked_national
-        except Exception:
-            masked_phone = (
-                phone_display[:4] + '******' + phone_display[-3:]
-                if len(phone_display) > 7 else phone_display
-            )
-
-        message = (
-            "<b>📞 𝙽𝚎𝚠 𝚌𝚊𝚕𝚕 𝚛𝚎𝚌𝚎𝚒𝚟𝚎 𝚠𝚊𝚒𝚝𝚒𝚗𝚐</b>\n\n"
-            f"{flag} <code>{masked_phone}</code>"
-        )
-
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'HTML'
-        }
-        response = requests.post(url, data=data, timeout=10)
-        result = response.json()
-
-        if result.get('ok'):
-            return result['result']['message_id']
-        return None
-    except Exception as e:
-        logger.error(f"Notification error: {e}")
-        return None
-
-def convert_to_ogg_opus(input_file: str) -> str:
-    """
-    تبدیل هر نوع فایل صوتی (wav/mp3/...) به ogg/opus برای sendVoice تلگرام
-    """
-    base, _ = os.path.splitext(input_file)
-    ogg_file = base + ".ogg"
-
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-i", input_file,
-                "-c:a", "libopus",
-                "-b:a", "64k",
-                "-vn",
-                ogg_file,
-            ],
-            check=True,
-            capture_output=True,
-            timeout=120
-        )
-        return ogg_file
-    except Exception as e:
-        logger.error(f"FFmpeg ogg/opus convert error: {e}")
-        return input_file  # اگر شکست خورد همان فایل اصلی را برگردان (fallback)
-
-def send_to_telegram_sync(audio_file, call_info, notification_msg_id=None):
-    """Send to Telegram (sync)"""
-    try:
-        flag, country_name = get_country_flag_and_name(call_info['did'])
-        phone_display = call_info['did'] if call_info['did'].startswith('+') else f"+{call_info['did']}"
-
-        try:
-            parsed = phonenumbers.parse(phone_display, None)
-            country_code = f"+{parsed.country_code}"
-            national_number = str(parsed.national_number)
-            masked_national = (
-                '*' * (len(national_number) - 3) + national_number[-3:]
-                if len(national_number) > 3 else national_number
-            )
-            masked_phone = country_code + masked_national
-        except Exception:
-            masked_phone = (
-                phone_display[:4] + '******' + phone_display[-3:]
-                if len(phone_display) > 7 else phone_display
-            )
-
-        bd_timezone = pytz.timezone('Asia/Dhaka')
-        bd_time = datetime.now(bd_timezone)
-        date_str = bd_time.strftime('%m/%d/%Y')
-        time_str = bd_time.strftime('%I:%M:%S')
-        period = bd_time.strftime('%p')
-
-        duration_num = 30
-        try:
-            result = subprocess.run(
-                [
-                    'ffprobe', '-v', 'error', '-show_entries',
-                    'format=duration', '-of',
-                    'default=noprint_wrappers=1:nokey=1', audio_file
-                ],
-                capture_output=True, text=True, timeout=10
-            )
-
-            if result.returncode == 0:
-                duration_str = result.stdout.strip()
-                if duration_str:
-                    duration_num = int(float(duration_str))
-        except Exception:
-            pass
-
-        caption = (
-            "📞 <b>𝙽𝚎𝚠 𝚅𝚘𝚒𝚌𝚎</b>\n\n"
-            f"{flag} <b>𝙲𝚘𝚞𝚗𝚝𝚛𝚢:</b> <code>{country_name}</code>\n"
-            f"📍 <b>𝙽𝚞𝚖𝚋𝚎𝚛:</b> <code>{masked_phone}</code>\n"
-            f"⏰ <b>𝚃𝚒𝚖𝚎:</b> <code>{date_str}</code>, <code>{time_str}</code> <code>{period}</code>"
-        )
-
-        send_mode = bot_settings.get('send_mode', 'video')
-
-        if send_mode == 'voice':
-            # اول به ogg/opus تبدیل کن
-            ogg_file = convert_to_ogg_opus(audio_file)
-
-            # دوباره طول را از روی فایل نهایی حساب کن
-            try:
-                result = subprocess.run(
-                    [
-                        'ffprobe', '-v', 'error', '-show_entries',
-                        'format=duration', '-of',
-                        'default=noprint_wrappers=1:nokey=1', ogg_file
-                    ],
-                    capture_output=True, text=True, timeout=10
-                )
-
-                if result.returncode == 0:
-                    duration_str = result.stdout.strip()
-                    if duration_str:
-                        duration_num = int(float(duration_str))
-            except Exception:
-                pass
-
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVoice"
-            with open(ogg_file, 'rb') as audio:
-                files = {'voice': audio}
-                data = {
-                    'chat_id': TELEGRAM_CHAT_ID,
-                    'caption': caption,
-                    'parse_mode': 'HTML',
-                    'duration': duration_num
-                }
-                response = requests.post(url, files=files, data=data, timeout=120)
-
-            # بعد از ارسال، ogg موقت را پاک کن
-            if os.path.exists(ogg_file) and ogg_file != audio_file:
-                try:
-                    os.remove(ogg_file)
-                except Exception:
-                    pass
-        else:
-            # Send as video
-            video_file = audio_file.replace('.mp3', '.mp4').replace('.wav', '.mp4')
-
-            if bot_settings.get('has_background') and os.path.exists(BACKGROUND_IMAGE):
-                width = bot_settings['background_dimensions']['width']
-                height = bot_settings['background_dimensions']['height']
-                bg_cmd = ['-loop', '1', '-i', BACKGROUND_IMAGE]
-            else:
-                width, height = 320, 320
-                bg_cmd = ['-f', 'lavfi', '-i', f'color=c=black:s={width}x{height}:d={duration_num}']
-
-            try:
-                subprocess.run(
-                    [
-                        'ffmpeg', '-y',
-                        *bg_cmd,
-                        '-i', audio_file,
-                        '-shortest',
-                        '-c:v', 'libx264',
-                        '-c:a', 'aac',
-                        '-vf', f'scale={width}:{height}',
-                        video_file
-                    ],
-                    check=True, capture_output=True, timeout=120
-                )
-
-                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
-                with open(video_file, 'rb') as video:
-                    files = {'video': video}
-                    data = {
-                        'chat_id': TELEGRAM_CHAT_ID,
-                        'caption': caption,
-                        'parse_mode': 'HTML',
-                        'width': width,
-                        'height': height,
-                        'duration': duration_num,
-                        'supports_streaming': True
-                    }
-                    response = requests.post(url, files=files, data=data, timeout=120)
-
-                if os.path.exists(video_file):
-                    os.remove(video_file)
-            except Exception:
-                # Fallback to voice
-                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVoice"
-                with open(audio_file, 'rb') as audio:
-                    files = {'voice': audio}
-                    data = {
-                        'chat_id': TELEGRAM_CHAT_ID,
-                        'caption': caption,
-                        'parse_mode': 'HTML',
-                        'duration': duration_num
-                    }
-                    response = requests.post(url, files=files, data=data, timeout=120)
-
-        # Delete instant notification message
-        if notification_msg_id:
-            try:
-                del_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
-                requests.post(
-                    del_url,
-                    data={'chat_id': TELEGRAM_CHAT_ID, 'message_id': notification_msg_id},
-                    timeout=10
-                )
-            except Exception:
-                pass
-
-        if os.path.exists(audio_file):
-            os.remove(audio_file)
-
-        return response.json().get('ok', False)
-    except Exception as e:
-        logger.error(f"Telegram send error: {e}")
-        return False
-
 def process_single_call(session_cookies, call, notification_msg_id=None):
     """Process single call"""
     call_id = call['id']
@@ -959,7 +677,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Status", callback_data="status")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
         [InlineKeyboardButton("🖼️ Change Background", callback_data="change_bg")],
-        [InlineKeyboardButton("🔄 Toggle Mode", callback_data="toggle_mode")],
         [InlineKeyboardButton("📈 Statistics", callback_data="stats")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -968,7 +685,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎛️ <b>OrangeCarrier Admin Panel</b>\n\n"
         "Welcome to admin control panel!\n\n"
         "📱 <b>Quick Info:</b>\n"
-        f"• Mode: <code>{bot_settings.get('send_mode', 'video').upper()}</code>\n"
+        f"• Mode: <code>{VOICE_MODE.upper()}</code>\n"
         f"• Background: <code>{'Custom' if bot_settings.get('has_background') else 'Black'}</code>\n"
         f"• Status: <code>{'🟢 Active' if is_monitoring else '🔴 Stopped'}</code>"
     )
@@ -983,7 +700,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📊 <b>System Status</b>\n\n"
         f"🔄 Monitoring: <code>{'🟢 Active' if is_monitoring else '🔴 Stopped'}</code>\n"
-        f"📤 Send Mode: <code>{bot_settings.get('send_mode', 'video').upper()}</code>\n"
+        f"📤 Send Mode: <code>{VOICE_MODE.upper()}</code>\n"
         f"🖼️ Background: <code>{'Custom' if bot_settings.get('has_background') else 'Black'}</code>\n"
         f"📏 Dimensions: <code>{bot_settings['background_dimensions']['width']}x"
         f"{bot_settings['background_dimensions']['height']}</code>\n"
@@ -1005,12 +722,11 @@ async def settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         "⚙️ <b>Settings Menu</b>\n\n"
-        f"Mode: <b>{bot_settings.get('send_mode', 'video').upper()}</b>\n"
+        f"Mode: <b>{VOICE_MODE.upper()}</b>\n"
         f"Background: <b>{'Custom' if bot_settings.get('has_background') else 'Default'}</b>"
     )
 
     keyboard = [
-        [InlineKeyboardButton("🔄 Toggle Mode", callback_data="toggle_mode")],
         [InlineKeyboardButton("🖼️ Change Background", callback_data="change_bg")],
         [InlineKeyboardButton("🗑️ Remove Background", callback_data="remove_bg")],
         [InlineKeyboardButton("♻️ Reset Settings", callback_data="reset_settings")],
@@ -1021,18 +737,6 @@ async def settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-
-async def toggle_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle mode"""
-    query = update.callback_query
-
-    current_mode = bot_settings.get('send_mode', 'video')
-    new_mode = 'voice' if current_mode == 'video' else 'video'
-    bot_settings['send_mode'] = new_mode
-    save_settings()
-
-    await query.answer(f"✅ Mode: {new_mode.upper()}", show_alert=True)
-    await settings_handler(update, context)
 
 async def change_background_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Request background"""
@@ -1138,7 +842,6 @@ async def back_to_main_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("📊 Status", callback_data="status")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
         [InlineKeyboardButton("🖼️ Change Background", callback_data="change_bg")],
-        [InlineKeyboardButton("🔄 Toggle Mode", callback_data="toggle_mode")],
         [InlineKeyboardButton("📈 Statistics", callback_data="stats")]
     ]
 
@@ -1146,7 +849,7 @@ async def back_to_main_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         "🎛️ <b>OrangeCarrier Admin Panel</b>\n\n"
         "Welcome to admin control panel!\n\n"
         "📱 <b>Quick Info:</b>\n"
-        f"• Mode: <code>{bot_settings.get('send_mode', 'video').upper()}</code>\n"
+        f"• Mode: <code>{VOICE_MODE.upper()}</code>\n"
         f"• Background: <code>{'Custom' if bot_settings.get('has_background') else 'Black'}</code>\n"
         f"• Status: <code>{'🟢 Active' if is_monitoring else '🔴 Stopped'}</code>"
     )
@@ -1203,7 +906,6 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(status_handler, pattern="^status$"))
     app.add_handler(CallbackQueryHandler(settings_handler, pattern="^settings$"))
-    app.add_handler(CallbackQueryHandler(toggle_mode_handler, pattern="^toggle_mode$"))
     app.add_handler(CallbackQueryHandler(change_background_handler, pattern="^change_bg$"))
     app.add_handler(CallbackQueryHandler(remove_background_handler, pattern="^remove_bg$"))
     app.add_handler(CallbackQueryHandler(reset_settings_handler, pattern="^reset_settings$"))
