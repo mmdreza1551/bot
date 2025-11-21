@@ -16,9 +16,12 @@ ADMIN_IDS = ['1651389674', '96384286']
 
 # Settings File
 SETTINGS_FILE = 'bot_settings.json'
+BACKGROUND_IMAGE = 'background.jpg'
 
 # Default Settings
 DEFAULT_SETTINGS = {
+    'has_background': False,
+    'background_dimensions': {'width': 320, 'height': 320},
     'monitoring_active': True,
     'retry_attempts': 3,
     'retry_delay': 30
