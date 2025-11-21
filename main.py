@@ -48,22 +48,7 @@ from config import (
     TELEGRAM_CHAT_ID,
     VOICE_MODE,
 )
-from messaging import send_instant_notification_sync, send_to_telegram_sync
-
-from config import (
-    ADMIN_IDS,
-    BACKGROUND_IMAGE,
-    DEFAULT_SETTINGS,
-    LOGIN_EMAIL,
-    LOGIN_PASSWORD,
-    ORANGECARRIER_CALLS_URL,
-    ORANGECARRIER_LOGIN_URL,
-    SETTINGS_FILE,
-    TELEGRAM_BOT_TOKEN,
-    TELEGRAM_CHAT_ID,
-    VOICE_MODE,
-)
-from messaging import send_instant_notification_sync, send_to_telegram_sync
+from messaging import broadcast_admins_sync, send_instant_notification_sync, send_to_telegram_sync
 
 logging.basicConfig(
     level=logging.INFO,
@@ -141,30 +126,21 @@ def wait_size_stable(session, url, headers, stable_checks=5, max_wait=90):
         waited += 1
     return last
 
-def get_image_dimensions(image_path):
-    """دریافت ابعاد تصویر"""
-    try:
-        with Image.open(image_path) as img:
-            return img.size
-    except Exception as e:
-        logger.error(f"Error getting image dimensions: {e}")
-        return (320, 320)
+# ==================== Admin Notification System ====================
+
+def notify_admins_error(title: str, details: str):
+    message = (
+        f"❗ <b>{title}</b>\n\n"
+        f"{details}\n\n"
+        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    notify_admins_sync(message)
 
 # ==================== Admin Notification System ====================
 
 def notify_admins_sync(message: str):
     """ارسال نوتیفیکیشن به تمام ادمین‌ها (سینک)"""
-    for admin_id in ADMIN_IDS:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            data = {
-                'chat_id': admin_id,
-                'text': f"🔔 <b>Admin Notification</b>\n\n{message}",
-                'parse_mode': 'HTML'
-            }
-            requests.post(url, data=data, timeout=10)
-        except Exception as e:
-            logger.error(f"Failed to notify admin {admin_id}: {e}")
+    broadcast_admins_sync(message, ADMIN_IDS)
 
 def notify_connection_lost(reason: str = "Unknown"):
     """اطلاع قطع اتصال به ادمین‌ها"""
@@ -301,6 +277,7 @@ def login_to_orangecarrier(driver, max_retries: int = 3) -> bool:
                 notify_connection_lost(f"Login failed after {max_retries} attempts")
             time.sleep(bot_settings.get('retry_delay', 30))
 
+    logger.error("❌ Login failed after all retries; site not reachable")
     return False
 
 # ==================== Call Processing ====================
@@ -774,8 +751,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [InlineKeyboardButton("📊 Status", callback_data="status")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
-        [InlineKeyboardButton("🖼️ Change Background", callback_data="change_bg")],
         [InlineKeyboardButton("📈 Statistics", callback_data="stats")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -785,7 +760,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Welcome to admin control panel!\n\n"
         "📱 <b>Quick Info:</b>\n"
         f"• Mode: <code>{VOICE_MODE.upper()}</code>\n"
-        f"• Background: <code>{'Custom' if bot_settings.get('has_background') else 'Black'}</code>\n"
         f"• Status: <code>{'🟢 Active' if is_monitoring else '🔴 Stopped'}</code>"
     )
 
@@ -800,9 +774,6 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 <b>System Status</b>\n\n"
         f"🔄 Monitoring: <code>{'🟢 Active' if is_monitoring else '🔴 Stopped'}</code>\n"
         f"📤 Send Mode: <code>{VOICE_MODE.upper()}</code>\n"
-        f"🖼️ Background: <code>{'Custom' if bot_settings.get('has_background') else 'Black'}</code>\n"
-        f"📏 Dimensions: <code>{bot_settings['background_dimensions']['width']}x"
-        f"{bot_settings['background_dimensions']['height']}</code>\n"
         f"📞 Processed: <code>{len(processed_calls)}</code>\n"
         f"⏰ Time: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
     )
@@ -813,105 +784,6 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-
-async def settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show settings"""
-    query = update.callback_query
-    await query.answer()
-
-    text = (
-        "⚙️ <b>Settings Menu</b>\n\n"
-        f"Mode: <b>{VOICE_MODE.upper()}</b>\n"
-        f"Background: <b>{'Custom' if bot_settings.get('has_background') else 'Default'}</b>"
-    )
-
-    keyboard = [
-        [InlineKeyboardButton("🖼️ Change Background", callback_data="change_bg")],
-        [InlineKeyboardButton("🗑️ Remove Background", callback_data="remove_bg")],
-        [InlineKeyboardButton("♻️ Reset Settings", callback_data="reset_settings")],
-        [InlineKeyboardButton("« Back", callback_data="back_to_main")]
-    ]
-    await query.edit_message_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def change_background_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Request background"""
-    query = update.callback_query
-    await query.answer()
-
-    text = (
-        "🖼️ <b>Upload Background Image</b>\n\n"
-        "Send me an image to use as background.\n\n"
-        "📝 Tips:\n"
-        "• Any size supported\n"
-        "• Video will match image size\n"
-        "• JPG/PNG supported\n\n"
-        "Send the image now..."
-    )
-
-    keyboard = [[InlineKeyboardButton("« Cancel", callback_data="settings")]]
-    await query.edit_message_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def handle_background_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle uploaded image"""
-    user_id = str(update.effective_user.id)
-
-    if user_id not in ADMIN_IDS:
-        return
-
-    try:
-        photo = update.message.photo[-1]
-        photo_file = await photo.get_file()
-        await photo_file.download_to_drive(BACKGROUND_IMAGE)
-
-        width, height = get_image_dimensions(BACKGROUND_IMAGE)
-
-        bot_settings['has_background'] = True
-        bot_settings['background_dimensions'] = {'width': width, 'height': height}
-        save_settings()
-
-        await update.message.reply_text(
-            f"✅ <b>Background Updated!</b>\n\n"
-            f"📏 Dimensions: <code>{width}x{height}</code>",
-            parse_mode=ParseMode.HTML
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
-async def remove_background_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove background"""
-    query = update.callback_query
-
-    if os.path.exists(BACKGROUND_IMAGE):
-        os.remove(BACKGROUND_IMAGE)
-
-    bot_settings['has_background'] = False
-    bot_settings['background_dimensions'] = {'width': 320, 'height': 320}
-    save_settings()
-
-    await query.answer("✅ Background removed", show_alert=True)
-    await settings_handler(update, context)
-
-async def reset_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reset settings"""
-    query = update.callback_query
-
-    global bot_settings
-    bot_settings = DEFAULT_SETTINGS.copy()
-    save_settings()
-
-    if os.path.exists(BACKGROUND_IMAGE):
-        os.remove(BACKGROUND_IMAGE)
-
-    await query.answer("✅ Settings reset", show_alert=True)
-    await settings_handler(update, context)
 
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show stats"""
@@ -938,8 +810,6 @@ async def back_to_main_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     keyboard = [
         [InlineKeyboardButton("📊 Status", callback_data="status")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
-        [InlineKeyboardButton("🖼️ Change Background", callback_data="change_bg")],
         [InlineKeyboardButton("📈 Statistics", callback_data="stats")]
     ]
 
@@ -948,7 +818,6 @@ async def back_to_main_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         "Welcome to admin control panel!\n\n"
         "📱 <b>Quick Info:</b>\n"
         f"• Mode: <code>{VOICE_MODE.upper()}</code>\n"
-        f"• Background: <code>{'Custom' if bot_settings.get('has_background') else 'Black'}</code>\n"
         f"• Status: <code>{'🟢 Active' if is_monitoring else '🔴 Stopped'}</code>"
     )
 
@@ -998,10 +867,6 @@ def main():
     # Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(status_handler, pattern="^status$"))
-    app.add_handler(CallbackQueryHandler(settings_handler, pattern="^settings$"))
-    app.add_handler(CallbackQueryHandler(change_background_handler, pattern="^change_bg$"))
-    app.add_handler(CallbackQueryHandler(remove_background_handler, pattern="^remove_bg$"))
-    app.add_handler(CallbackQueryHandler(reset_settings_handler, pattern="^reset_settings$"))
     app.add_handler(CallbackQueryHandler(stats_handler, pattern="^stats$"))
     app.add_handler(CallbackQueryHandler(back_to_main_handler, pattern="^back_to_main$"))
 

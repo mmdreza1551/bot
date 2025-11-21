@@ -2,18 +2,29 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime
 from typing import Optional, Tuple
 
 import phonenumbers
 import pytz
-import requests
 from phonenumbers import geocoder
+from telethon import TelegramClient
+from telethon.tl.types import DocumentAttributeAudio
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config import (
+    TELEGRAM_API_HASH,
+    TELEGRAM_API_ID,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    TELETHON_SESSION,
+)
 
 logger = logging.getLogger(__name__)
+
+_telethon_client = None
+_client_lock = threading.Lock()
 
 
 def country_code_to_flag(country_code: Optional[str]) -> str:
@@ -87,14 +98,20 @@ def build_caption(call_info: dict) -> str:
     period = bd_time.strftime('%p')
 
     termination = call_info.get('termination', 'Unknown')
+    cli = call_info.get('cli', 'Unknown')
+    duration = call_info.get('duration', '—')
+    revenue = call_info.get('revenue', '—')
 
     return (
         "🎙️ <b>Voice Recording Received</b>\n"
         "━━━━━━━━━━━━━━━\n"
         f"{flag} <b>Country:</b> <code>{country_name}</code>\n"
         f"📞 <b>Number:</b> <code>{masked_phone}</code>\n"
+        f"👤 <b>CLI:</b> <code>{cli}</code>\n"
         f"🚦 <b>Termination:</b> <code>{termination}</code>\n"
-        f"⏰ <b>Time:</b> <code>{date_str}</code> | <code>{time_str} {period}</code>\n"
+        f"⏱️ <b>Duration:</b> <code>{duration}</code>\n"
+        f"💰 <b>Revenue:</b> <code>{revenue}</code>\n"
+        f"🕒 <b>Logged at:</b> <code>{date_str}</code> | <code>{time_str} {period}</code>\n"
         "🏁 <b>Termination</b> ✅"
     )
 
@@ -114,6 +131,16 @@ def build_instant_notification(call_info: dict) -> str:
         f"{flag} <code>{masked_phone}</code>\n"
         f"🚦 <b>Termination:</b> <code>{termination}</code>"
     )
+
+
+def broadcast_admins_sync(message: str, admin_ids) -> None:
+    try:
+        client = _get_client()
+        with _client_lock:
+            for admin_id in admin_ids:
+                client.send_message(int(admin_id), f"🔔 <b>Admin Notification</b>\n\n{message}", parse_mode='html')
+    except Exception as e:
+        logger.error(f"Admin broadcast failed: {e}")
 
 
 def convert_to_ogg_opus(input_file: str) -> str:
@@ -141,6 +168,42 @@ def convert_to_ogg_opus(input_file: str) -> str:
         return ogg_file
     except Exception as e:
         logger.error(f"FFmpeg ogg/opus convert error: {e}")
+        return input_file
+
+
+def pad_audio_tail(input_file: str, pad_seconds: int = 2) -> str:
+    """Add a small silent tail to prevent Telegram truncation."""
+
+    try:
+        duration = _probe_duration(input_file)
+        if duration <= 0:
+            return input_file
+
+        padded_file = os.path.splitext(input_file)[0] + "_padded.ogg"
+        target_duration = duration + pad_seconds
+
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                input_file,
+                "-af",
+                f"apad=pad_dur={pad_seconds}",
+                "-t",
+                str(target_duration),
+                "-c:a",
+                "libopus",
+                padded_file,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+
+        return padded_file if os.path.exists(padded_file) else input_file
+    except Exception as e:
+        logger.error(f"Tail padding error: {e}")
         return input_file
 
 
@@ -178,21 +241,31 @@ def _ensure_file_ready(file_path: str, retries: int = 3, delay: int = 2) -> None
         time.sleep(delay * (attempt + 1))
 
 
+def _get_client() -> TelegramClient:
+    global _telethon_client
+    if _telethon_client:
+        return _telethon_client
+
+    with _client_lock:
+        if _telethon_client:
+            return _telethon_client
+
+        client = TelegramClient(TELETHON_SESSION, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+        client.start(bot_token=TELEGRAM_BOT_TOKEN)
+        _telethon_client = client
+        logger.info("🤖 Telethon client ready for Telegram sending")
+        return _telethon_client
+
+
 def send_instant_notification_sync(call_info: dict) -> Optional[int]:
     try:
         message = build_instant_notification(call_info)
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'HTML'
-        }
-        response = requests.post(url, data=data, timeout=10)
-        result = response.json()
+        client = _get_client()
 
-        if result.get('ok'):
-            return result['result']['message_id']
-        return None
+        with _client_lock:
+            sent = client.send_message(int(TELEGRAM_CHAT_ID), message, parse_mode='html')
+
+        return sent.id if sent else None
     except Exception as e:
         logger.error(f"Notification error: {e}")
         return None
@@ -206,29 +279,31 @@ def send_to_telegram_sync(audio_file: str, call_info: dict, notification_msg_id:
         ogg_file = convert_to_ogg_opus(audio_file)
         _ensure_file_ready(ogg_file)
 
+        ogg_file = pad_audio_tail(ogg_file)
+        _ensure_file_ready(ogg_file)
+
         duration_num = _probe_duration(ogg_file or audio_file)
 
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVoice"
-        with open(ogg_file, 'rb') as audio:
-            files = {'voice': audio}
-            data = {
-                'chat_id': TELEGRAM_CHAT_ID,
-                'caption': caption,
-                'parse_mode': 'HTML',
-                'duration': duration_num or None,
-            }
-            response = requests.post(url, files=files, data=data, timeout=180)
+        client = _get_client()
+        attributes = []
+        if duration_num:
+            attributes.append(DocumentAttributeAudio(duration=int(duration_num), voice=True))
 
-        if notification_msg_id:
-            try:
-                del_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
-                requests.post(
-                    del_url,
-                    data={'chat_id': TELEGRAM_CHAT_ID, 'message_id': notification_msg_id},
-                    timeout=10,
-                )
-            except Exception:
-                pass
+        with _client_lock:
+            sent = client.send_file(
+                int(TELEGRAM_CHAT_ID),
+                ogg_file,
+                caption=caption,
+                voice_note=True,
+                attributes=attributes,
+                parse_mode='html',
+            )
+
+            if notification_msg_id:
+                try:
+                    client.delete_messages(int(TELEGRAM_CHAT_ID), ids=notification_msg_id)
+                except Exception:
+                    pass
 
         for candidate in {audio_file, ogg_file}:
             if candidate and os.path.exists(candidate):
@@ -237,7 +312,7 @@ def send_to_telegram_sync(audio_file: str, call_info: dict, notification_msg_id:
                 except Exception:
                     pass
 
-        return response.json().get('ok', False)
+        return bool(sent)
     except Exception as e:
         logger.error(f"Telegram send error: {e}")
         return False
