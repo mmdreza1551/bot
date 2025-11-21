@@ -6,10 +6,9 @@ try:
     import pytz
     from telegram import Bot
     from webdriver_manager.chrome import ChromeDriverManager
-    from PIL import Image
 except ImportError as e:
     print(f"ERROR: Missing required package: {e}")
-    print("Please run: pip install -r requirements.txt pillow")
+    print("Please run: pip install -r requirements.txt")
     sys.exit(1)
 
 import os
@@ -26,7 +25,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 import subprocess
 from datetime import datetime
@@ -35,7 +34,21 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import json
 import shlex
-from PIL import Image
+import traceback
+
+from config import (
+    ADMIN_IDS,
+    DEFAULT_SETTINGS,
+    LOGIN_EMAIL,
+    LOGIN_PASSWORD,
+    ORANGECARRIER_CALLS_URL,
+    ORANGECARRIER_LOGIN_URL,
+    SETTINGS_FILE,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    VOICE_MODE,
+)
+from messaging import send_instant_notification_sync, send_to_telegram_sync
 
 from config import (
     ADMIN_IDS,
@@ -64,6 +77,7 @@ processed_calls = set()
 driver_instance = None
 is_monitoring = False
 telegram_app = None
+connection_issue_reported = False
 
 # ==================== Settings Manager ====================
 
@@ -516,7 +530,7 @@ def get_active_calls(driver):
         return []
 
 def download_audio_via_api(session_cookies, did, uuid, call_id, wait_for_completion=True):
-    """Download audio via API"""
+    """Download audio via API with stronger completeness checks"""
     try:
         api_url = f"https://www.orangecarrier.com/live/calls/sound?did={did}&uuid={uuid}"
 
@@ -534,8 +548,13 @@ def download_audio_via_api(session_cookies, did, uuid, call_id, wait_for_complet
 
         if wait_for_completion:
             logger.info(f"⏳ [{call_id}] Waiting for recording...")
-            wait_size_stable(session, api_url + f"&_ts={int(time.time())}", headers,
-                             stable_checks=5, max_wait=90)
+            wait_size_stable(
+                session,
+                api_url + f"&_ts={int(time.time())}",
+                headers,
+                stable_checks=6,
+                max_wait=120,
+            )
 
         r = session.get(api_url + f"&_ts={int(time.time())}", headers=headers, timeout=180)
         r.raise_for_status()
@@ -551,11 +570,20 @@ def download_audio_via_api(session_cookies, did, uuid, call_id, wait_for_complet
             f.write(r.content)
 
         target = 6.5
-        for attempt in range(3):
+        max_attempts = 5
+        for attempt in range(max_attempts):
             dur = ffprobe_duration(filename)
             if dur >= target:
                 return filename
-            time.sleep(3 * (attempt + 1))
+
+            wait_size_stable(
+                session,
+                api_url + f"&_ts={int(time.time())}",
+                headers,
+                stable_checks=4,
+                max_wait=45,
+            )
+            time.sleep(2 * (attempt + 1))
             r = session.get(api_url + f"&_ts={int(time.time())}", headers=headers, timeout=180)
             r.raise_for_status()
             with open(filename, 'wb') as f:
@@ -586,16 +614,29 @@ def process_single_call(session_cookies, call, notification_msg_id=None):
                 if success:
                     logger.info(f"✅ [{call_id}] Forwarded!")
                     return True
+                notify_admins_error(
+                    "Telegram send failed",
+                    f"Call {call_id} could not be delivered."
+                )
+            else:
+                notify_admins_error(
+                    "Download failed",
+                    f"Call {call_id} audio was empty or unavailable."
+                )
         return False
     except Exception as e:
         logger.error(f"❌ [{call_id}] Error: {e}")
+        notify_admins_error(
+            "Call processing error",
+            f"{call_id}: {e}\n{traceback.format_exc(limit=1)}"
+        )
         return False
 
 # ==================== Monitoring ====================
 
 def monitor_calls_with_recovery():
     """Monitor calls with auto-recovery"""
-    global is_monitoring, driver_instance
+    global is_monitoring, driver_instance, connection_issue_reported
 
     logger.info("🚀 Starting monitoring...")
 
@@ -610,7 +651,9 @@ def monitor_calls_with_recovery():
 
                 if "login" in driver_instance.current_url.lower():
                     logger.warning("⚠️ Session expired, reconnecting...")
-                    notify_connection_lost("Session expired")
+                    if not connection_issue_reported:
+                        notify_connection_lost("Session expired")
+                        connection_issue_reported = True
                     if not login_to_orangecarrier(driver_instance):
                         consecutive_errors += 1
                         if consecutive_errors >= max_errors:
@@ -620,9 +663,13 @@ def monitor_calls_with_recovery():
                         time.sleep(bot_settings.get('retry_delay', 30))
                         continue
                     consecutive_errors = 0
+                    connection_issue_reported = False
             except Exception as e:
                 logger.error(f"Connection check failed: {e}")
                 consecutive_errors += 1
+                if not connection_issue_reported:
+                    notify_connection_lost(f"Connection check failed: {e}")
+                    connection_issue_reported = True
                 if consecutive_errors >= max_errors:
                     break
                 time.sleep(bot_settings.get('retry_delay', 30))
@@ -630,6 +677,10 @@ def monitor_calls_with_recovery():
 
             session_cookies = driver_instance.get_cookies()
             calls = get_active_calls(driver_instance)
+
+            if connection_issue_reported:
+                notify_connection_restored()
+                connection_issue_reported = False
 
             if calls:
                 new_calls = [call for call in calls if call['id'] not in processed_calls]
@@ -822,8 +873,7 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📈 <b>Statistics</b>\n\n"
         f"📞 Total Calls: <code>{len(processed_calls)}</code>\n"
-        f"💾 Settings: <code>{'✅' if os.path.exists(SETTINGS_FILE) else '❌'}</code>\n"
-        f"🖼️ Background: <code>{'✅' if os.path.exists(BACKGROUND_IMAGE) else '❌'}</code>"
+        f"💾 Settings: <code>{'✅' if os.path.exists(SETTINGS_FILE) else '❌'}</code>"
     )
 
     keyboard = [[InlineKeyboardButton("« Back", callback_data="back_to_main")]]
@@ -911,14 +961,6 @@ def main():
     app.add_handler(CallbackQueryHandler(reset_settings_handler, pattern="^reset_settings$"))
     app.add_handler(CallbackQueryHandler(stats_handler, pattern="^stats$"))
     app.add_handler(CallbackQueryHandler(back_to_main_handler, pattern="^back_to_main$"))
-
-    # فقط ادمین‌ها اجازه آپلود بک‌گراند دارند
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO & filters.User(user_id=[int(i) for i in ADMIN_IDS]),
-            handle_background_image
-        )
-    )
 
     logger.info("🤖 Telegram bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
