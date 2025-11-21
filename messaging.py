@@ -87,20 +87,14 @@ def build_caption(call_info: dict) -> str:
     period = bd_time.strftime('%p')
 
     termination = call_info.get('termination', 'Unknown')
-    cli = call_info.get('cli', 'Unknown')
-    duration = call_info.get('duration', '—')
-    revenue = call_info.get('revenue', '—')
 
     return (
         "🎙️ <b>Voice Recording Received</b>\n"
         "━━━━━━━━━━━━━━━\n"
         f"{flag} <b>Country:</b> <code>{country_name}</code>\n"
         f"📞 <b>Number:</b> <code>{masked_phone}</code>\n"
-        f"👤 <b>CLI:</b> <code>{cli}</code>\n"
         f"🚦 <b>Termination:</b> <code>{termination}</code>\n"
-        f"⏱️ <b>Duration:</b> <code>{duration}</code>\n"
-        f"💰 <b>Revenue:</b> <code>{revenue}</code>\n"
-        f"🕒 <b>Logged at:</b> <code>{date_str}</code> | <code>{time_str} {period}</code>\n"
+        f"⏰ <b>Time:</b> <code>{date_str}</code> | <code>{time_str} {period}</code>\n"
         "🏁 <b>Termination</b> ✅"
     )
 
@@ -147,42 +141,6 @@ def convert_to_ogg_opus(input_file: str) -> str:
         return ogg_file
     except Exception as e:
         logger.error(f"FFmpeg ogg/opus convert error: {e}")
-        return input_file
-
-
-def pad_audio_tail(input_file: str, pad_seconds: int = 2) -> str:
-    """Add a small silent tail to prevent Telegram truncation."""
-
-    try:
-        duration = _probe_duration(input_file)
-        if duration <= 0:
-            return input_file
-
-        padded_file = os.path.splitext(input_file)[0] + "_padded.ogg"
-        target_duration = duration + pad_seconds
-
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                input_file,
-                "-af",
-                f"apad=pad_dur={pad_seconds}",
-                "-t",
-                str(target_duration),
-                "-c:a",
-                "libopus",
-                padded_file,
-            ],
-            check=True,
-            capture_output=True,
-            timeout=120,
-        )
-
-        return padded_file if os.path.exists(padded_file) else input_file
-    except Exception as e:
-        logger.error(f"Tail padding error: {e}")
         return input_file
 
 
@@ -248,9 +206,6 @@ def send_to_telegram_sync(audio_file: str, call_info: dict, notification_msg_id:
         ogg_file = convert_to_ogg_opus(audio_file)
         _ensure_file_ready(ogg_file)
 
-        ogg_file = pad_audio_tail(ogg_file)
-        _ensure_file_ready(ogg_file)
-
         duration_num = _probe_duration(ogg_file or audio_file)
 
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVoice"
@@ -263,13 +218,6 @@ def send_to_telegram_sync(audio_file: str, call_info: dict, notification_msg_id:
                 'duration': duration_num or None,
             }
             response = requests.post(url, files=files, data=data, timeout=180)
-
-        if not response.ok:
-            logger.error(
-                "Telegram sendVoice failed: status=%s body=%s",
-                response.status_code,
-                response.text[:500],
-            )
 
         if notification_msg_id:
             try:
